@@ -1,0 +1,321 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Serverless To-Do App with Event-Driven Expiry
+
+Globals:
+  Function:
+    Runtime: java21
+    Timeout: 15
+    MemorySize: 512
+
+Resources:
+
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub "${AWS::StackName}-user-pool"
+      UsernameAttributes:
+        - email
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireUppercase: false
+          RequireSymbols: false
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Required: true
+          Mutable: true
+      LambdaConfig:
+        PreSignUp: !GetAtt PreSignUpFunction.Arn
+        PostAuthentication: !GetAtt PostAuthFunction.Arn
+
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: !Sub "${AWS::StackName}-web-client"
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+
+  TaskNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${AWS::StackName}-task-notifications"
+
+  PreSignUpFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: auth/
+      Handler: com.todoapp.auth.PreSignUp::handleRequest
+
+  PreSignUpInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref PreSignUpFunction
+      Principal: cognito-idp.amazonaws.com
+      SourceArn: !GetAtt UserPool.Arn
+
+
+  # POST AUTH FUNCTION AND PERMISSION
+  PostAuthFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: auth/
+      Handler: com.todoapp.auth.PostAuth::handleRequest
+      Environment:
+        Variables:
+          TOPIC_ARN: !Ref TaskNotificationTopic
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: sns:Subscribe
+              Resource: !Ref TaskNotificationTopic
+
+  PostAuthInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref PostAuthFunction
+      Principal: cognito-idp.amazonaws.com
+      SourceArn: !GetAtt UserPool.Arn
+
+  # DynamoDB table for tasks
+  TaskTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${AWS::StackName}-tasks"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+
+  # api
+  TodoApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: prod
+      Cors:
+        AllowMethods: "'GET,POST,PUT,DELETE,OPTIONS'"
+        AllowHeaders: "'Content-Type,Authorization'"
+        AllowOrigin: "'*'"
+      Auth:
+        DefaultAuthorizer: CognitoAuthorizer
+        AddDefaultAuthorizerToCorsPreflight: false
+        Authorizers:
+          CognitoAuthorizer:
+            UserPoolArn: !GetAtt UserPool.Arn
+
+  # create task function
+  CreateTaskFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: api/
+      Handler: com.todoapp.api.CreateTask::handleRequest
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref TaskTable
+      Policies:
+        - DynamoDBWritePolicy:
+            TableName: !Ref TaskTable
+      Events:
+        CreateTask:
+          Type: Api
+          Properties:
+            RestApiId: !Ref TodoApi
+            Path: /tasks
+            Method: POST
+
+  # List task function
+  ListTasksFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: api/
+      Handler: com.todoapp.api.ListTasks::handleRequest
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref TaskTable
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref TaskTable
+      Events:
+        ListTasks:
+          Type: Api
+          Properties:
+            RestApiId: !Ref TodoApi
+            Path: /tasks
+            Method: GET
+
+  # update task function
+  UpdateTaskFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: api/
+      Handler: com.todoapp.api.UpdateTask::handleRequest
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref TaskTable
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TaskTable
+      Events:
+        UpdateTask:
+          Type: Api
+          Properties:
+            RestApiId: !Ref TodoApi
+            Path: /tasks/{taskId}
+            Method: PUT
+
+  # Delete task function
+  DeleteTaskFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: api/
+      Handler: com.todoapp.api.DeleteTask::handleRequest
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref TaskTable
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TaskTable
+      Events:
+        DeleteTask:
+          Type: Api
+          Properties:
+            RestApiId: !Ref TodoApi
+            Path: /tasks/{taskId}
+            Method: DELETE
+
+# sqs queue
+  ExpiryQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${AWS::StackName}-expiry.fifo"
+      FifoQueue: true
+      ContentBasedDeduplication: false
+      VisibilityTimeout: 60
+
+
+  # Stream bridge Function
+  StreamBridgeFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: expiry/
+      Handler: com.todoapp.expiry.StreamBridge::handleRequest
+      Environment:
+        Variables:
+          QUEUE_URL: !Ref ExpiryQueue
+      Policies:
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt ExpiryQueue.QueueName
+      Events:
+        StreamTrigger:
+          Type: DynamoDB
+          Properties:
+            Stream: !GetAtt TaskTable.StreamArn
+            StartingPosition: LATEST
+            BatchSize: 10
+
+  # Expiry handler function
+  ExpiryHandlerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: expiry/
+      Handler: com.todoapp.expiry.ExpiryHandler::handleRequest
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref TaskTable
+          TOPIC_ARN: !Ref TaskNotificationTopic
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TaskTable
+        - Statement:
+            - Effect: Allow
+              Action: sns:Publish
+              Resource: !Ref TaskNotificationTopic
+
+  # Scheduler execution rule
+  SchedulerExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeExpiryHandler
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt ExpiryHandlerFunction.Arn
+
+  # Schedule manager function:
+  ScheduleManagerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: expiry/
+      Handler: com.todoapp.expiry.ScheduleManager::handleRequest
+      Environment:
+        Variables:
+          EXPIRY_LAMBDA_ARN: !GetAtt ExpiryHandlerFunction.Arn
+          SCHEDULER_ROLE_ARN: !GetAtt SchedulerExecutionRole.Arn
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - scheduler:CreateSchedule
+                - scheduler:DeleteSchedule
+              Resource: "*"
+            - Effect: Allow
+              Action: iam:PassRole
+              Resource: !GetAtt SchedulerExecutionRole.Arn
+      Events:
+        QueueTrigger:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt ExpiryQueue.Arn
+            BatchSize: 1
+
+Outputs:
+  UserPoolId:
+    Description: Cognito User Pool ID
+    Value: !Ref UserPool
+  UserPoolClientId:
+    Description: Cognito User Pool Client ID
+    Value: !Ref UserPoolClient
+  TaskTableName:
+    Description: DynamoDB tasks table name
+    Value: !Ref TaskTable
+  TaskTableStreamArn:
+    Description: DynamoDB stream ARN
+    Value: !GetAtt TaskTable.StreamArn
+  ApiUrl:
+    Description: Base URL of the REST API
+    Value: !Sub "https://${TodoApi}.execute-api.${AWS::Region}.amazonaws.com/prod"
+  SchedulerRoleArn:
+    Description: IAM role ARN that EventBridge Shedules assume to invoke the expiry handler
+    Value: !GetAtt SchedulerExecutionRole.Arn
+  ExpiryHandlerArn:
+    Description: Expiry handler Lambda ARN
+    Value: !GetAtt ExpiryHandlerFunction.Arn
