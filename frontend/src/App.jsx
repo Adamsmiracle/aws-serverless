@@ -21,6 +21,37 @@ async function api(path, options = {}) {
   return text ? JSON.parse(text) : null;
 }
 
+function Section({ title, items, statusClass, onComplete, onDelete }) {
+  return (
+    <div className="section">
+      <div className="section-title">
+        {title} <span className="count-badge">{items.length}</span>
+      </div>
+      {items.length === 0 ? (
+        <p className="empty">No {title.toLowerCase()} tasks</p>
+      ) : (
+        items.map((t) => (
+          <div key={t.taskId} className={`task ${statusClass}`}>
+            <div className={`status-${t.status.toLowerCase()}`} style={{ display: 'flex', alignItems: 'center', gap: 10, flex: 1 }}>
+              <span className="status-dot"></span>
+              <div className="task-info">
+                <div className="task-desc">{t.description}</div>
+                <div className="task-meta">{t.date} · {t.status}</div>
+              </div>
+            </div>
+            <div className="task-actions">
+              {t.status === 'Pending' && (
+                <button className="btn-sm" onClick={() => onComplete(t.taskId)}>Complete</button>
+              )}
+              <button className="btn-sm danger" onClick={() => onDelete(t.taskId)}>Delete</button>
+            </div>
+          </div>
+        ))
+      )}
+    </div>
+  );
+}
+
 function App() {
   const [user, setUser] = useState(null);
   const [email, setEmail] = useState('');
@@ -32,10 +63,6 @@ function App() {
   const [tasks, setTasks] = useState([]);
   const [newDesc, setNewDesc] = useState('');
   const [loading, setLoading] = useState(false);
-
-  useEffect(() => {
-    getCurrentUser().then(setUser).catch(() => setUser(null));
-  }, []);
 
   // ---- Task operations ----
   const loadTasks = useCallback(async () => {
@@ -51,8 +78,10 @@ function App() {
   }, []);
 
   useEffect(() => {
-    if (user) loadTasks();
-  }, [user, loadTasks]);
+    getCurrentUser()
+      .then((u) => { setUser(u); loadTasks(); })
+      .catch(() => setUser(null));
+  }, [loadTasks]);
 
   async function createTask() {
     if (!newDesc.trim()) return;
@@ -84,6 +113,7 @@ function App() {
   async function doSignIn() {
     await signIn({ username: email, password });
     setUser(await getCurrentUser());
+    loadTasks();
   }
   async function handleSignUp() {
     setError(''); setBusy(true);
@@ -111,35 +141,6 @@ function App() {
     const completed = tasks.filter((t) => t.status === 'Completed');
     const expired = tasks.filter((t) => t.status === 'Expired');
 
-    const Section = ({ title, items, statusClass }) => (
-      <div className="section">
-        <div className="section-title">
-          {title} <span className="count-badge">{items.length}</span>
-        </div>
-        {items.length === 0 ? (
-          <p className="empty">No {title.toLowerCase()} tasks</p>
-        ) : (
-          items.map((t) => (
-            <div key={t.taskId} className={`task ${statusClass}`}>
-              <div className={`status-${t.status.toLowerCase()}`} style={{ display: 'flex', alignItems: 'center', gap: 10, flex: 1 }}>
-                <span className="status-dot"></span>
-                <div className="task-info">
-                  <div className="task-desc">{t.description}</div>
-                  <div className="task-meta">{t.date} · {t.status}</div>
-                </div>
-              </div>
-              <div className="task-actions">
-                {t.status === 'Pending' && (
-                  <button className="btn-sm" onClick={() => completeTask(t.taskId)}>Complete</button>
-                )}
-                <button className="btn-sm danger" onClick={() => deleteTask(t.taskId)}>Delete</button>
-              </div>
-            </div>
-          ))
-        )}
-      </div>
-    );
-
     return (
       <div className="app-wrap">
         <div className="app-header">
@@ -163,9 +164,9 @@ function App() {
         {error && <div className="error">{error}</div>}
         {loading && <p className="empty">Loading…</p>}
 
-        <Section title="Pending" items={pending} statusClass="pending" />
-        <Section title="Completed" items={completed} statusClass="completed" />
-        <Section title="Expired" items={expired} statusClass="expired" />
+        <Section title="Pending" items={pending} statusClass="pending" onComplete={completeTask} onDelete={deleteTask} />
+        <Section title="Completed" items={completed} statusClass="completed" onComplete={completeTask} onDelete={deleteTask} />
+        <Section title="Expired" items={expired} statusClass="expired" onComplete={completeTask} onDelete={deleteTask} />
       </div>
     );
   }
